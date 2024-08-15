@@ -76,8 +76,26 @@ def create_inner_while_loop_kernel():
     """
     return run_nvrtc(kernel_string, b"while_loop_conditional", _CUDA_PROGRAM_NAME)
 
+def nvrtc_compile_handle_setter():
+    kernel_string = r"""\
+    typedef __device_builtin__ unsigned long long cudaGraphConditionalHandle;
 
-class RNNTGreedyDecodeCudaGraph_:
+    extern "C" __device__ __cudart_builtin__ void cudaGraphSetConditional(cudaGraphConditionalHandle handle, unsigned int value);
+
+    extern "C" __global__
+    void conditional_handle_setter(cudaGraphConditionalHandle handle, const bool *pred)
+    {
+     cudaGraphSetConditional(handle, *pred);
+    }
+    """
+    return run_nvrtc(kernel_string, b"conditional_handle_setter", b"conditional_handle_setter.cu")
+
+# intentionally slow down the original version to investigate the cuda graph speed decrease with torch.while_loop
+# reason 1: customized kernel function to update the boolean in conditional handle
+# reason 2: extra "copy_()" calls caused by not being able to use the "out=" arguments in torch APIs
+# PyTorch issue for reason 2: https://github.com/pytorch/pytorch/issues/130176
+# (possible) reason 3: This PyTorch issue - https://github.com/pytorch/pytorch/issues/130791
+class RNNTGreedyDecodeCudaGraph_slow:
     def __init__(self, max_symbols: int, caller):
         if HAVE_CUDA_PYTHON:
             check_cuda_python_cuda_graphs_conditional_nodes_supported()
@@ -108,13 +126,19 @@ class RNNTGreedyDecodeCudaGraph_:
         self.max_time = 375
         self.batch_size = 0
 
-        self.scores_cpu = None
-        self.labels_cpu = None
+        self.scores_gpu = None
+        self.labels_gpu = None
         self.graph = None
 
         self.first_call = True
 
         self.caller = caller
+
+        # shape printer for debugggg...
+        # self.d1 = None
+        # self.d2 = None
+        # self.d3 = None
+        # self.d4 = None
 
     def _reinitialize(self, max_time, batch_size, encoder_output, encoder_output_length):
         if self.first_call:
@@ -157,15 +181,382 @@ class RNNTGreedyDecodeCudaGraph_:
         self.zero_t = torch.tensor(0.0, dtype=encoder_output.dtype, device=encoder_output.device)
         self.blank_index_t = torch.tensor(self.caller._blank_index, dtype=torch.long, device=encoder_output.device)
 
-        self.scores_cpu = torch.zeros(
+        self.scores_gpu = torch.zeros(
             (self.batch_size, self.max_time, self.max_symbols),
             dtype=encoder_output.dtype,
-            device="cpu",
-            pin_memory=True,
+            device="cuda",
         )
-        self.labels_cpu = torch.zeros(
-            (self.batch_size, self.max_time, self.max_symbols), dtype=torch.int64, device="cpu", pin_memory=True
+        self.labels_gpu = torch.zeros(
+            (self.batch_size, self.max_time, self.max_symbols), dtype=torch.int64, device="cuda",
         )
+
+        # shape printer for debugggg...
+        # self.d1 = torch.zeros(1, device="cpu", pin_memory=True)
+        # self.d2 = torch.zeros(1, device="cpu", pin_memory=True)
+        # self.d3 = torch.zeros(1, device="cpu", pin_memory=True)
+        # self.d4 = torch.zeros(1, device="cpu", pin_memory=True)
+
+        # Question: why is this line needed?
+        self.graph = None
+
+        self.graph = torch.cuda.CUDAGraph()
+
+        # Always create a new stream, because the per-thread default stream disallows stream capture to a graph.
+        stream_for_graph = torch.cuda.Stream(self.device)
+        with (
+            torch.cuda.stream(stream_for_graph),
+            torch.inference_mode(),
+            torch.cuda.graph(self.graph, stream=stream_for_graph, capture_error_mode="thread_local"),
+        ):
+            # This is failing...
+            self.f = torch.zeros(
+                (self.batch_size, 1, self.encoder_output.shape[-1]),
+                dtype=encoder_output.dtype,
+                device=encoder_output.device,
+            )
+            # Question: the behavior seems different to the original function?
+            hidden = self.caller.decoder.initialize_state(self.f)
+            self.last_label = torch.full(
+                [self.batch_size], fill_value=self.caller._SOS, dtype=torch.long, device=encoder_output.device
+            )
+            self.blank_mask = torch.full(
+                [self.batch_size], fill_value=0, dtype=torch.bool, device=encoder_output.device
+            )
+            self.seq_idx_t = torch.zeros([1], dtype=torch.int64, device=encoder_output.device)
+
+            self.scores = torch.zeros(
+                (self.max_time * self.max_symbols, self.batch_size),
+                dtype=encoder_output.dtype,
+                device=encoder_output.device,
+            )
+            self.labels = torch.full(
+                (self.max_time * self.max_symbols, self.batch_size),
+                fill_value=self.caller._blank_index,
+                dtype=torch.int64,
+                device=encoder_output.device,
+            )
+            # Get max sequence length
+            self.max_out_len_t = self.encoder_output_length.max()
+
+            capture_status, _, graph, _, _ = cu_call(
+                cudart.cudaStreamGetCaptureInfo(torch.cuda.current_stream(device=self.device).cuda_stream)
+            )
+            assert capture_status == cudart.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
+
+            (for_loop_conditional_handle,) = cu_call(cudart.cudaGraphConditionalHandleCreate(graph, 0, 0))
+            # for_loop_kernel = create_outer_for_loop_kernel()
+            # time_idx_ptr = np.array([self.time_idx_t.data_ptr()], dtype=np.uint64)
+            # max_out_len_ptr = np.array([self.max_out_len_t.data_ptr()], dtype=np.uint64)
+            # for_loop_args = np.array(
+            #     [for_loop_conditional_handle.getPtr(), time_idx_ptr.ctypes.data, max_out_len_ptr.ctypes.data],
+            #     dtype=np.uint64,
+            # )
+
+            for_loop_kernel = nvrtc_compile_handle_setter()
+            # calculate pred of the for-loop for the first time
+            pred_for = self.time_idx_t.sum() < self.max_out_len_t
+            pred_for_ptr = np.array([pred_for.data_ptr()], dtype=np.uint64)
+            for_loop_args = np.array(
+                [for_loop_conditional_handle.getPtr(), pred_for_ptr.ctypes.data],
+                dtype=np.uint64,
+            )
+
+            with with_conditional_node(for_loop_kernel, for_loop_args, for_loop_conditional_handle, self.device):
+                # torch.index_select(self.encoder_output, 1, self.time_idx_t.unsqueeze(0), out=self.f)
+                f = torch.index_select(self.encoder_output, 1, self.time_idx_t.unsqueeze(0))
+                self.f.copy_(f)
+
+                self.not_all_blank_t.fill_(True)
+                self.symbols_added_t.fill_(0)
+
+                # torch.ge(self.time_idx_t, self.encoder_output_length, out=self.blank_mask)
+                blank_mask = torch.ge(self.time_idx_t, self.encoder_output_length)
+                self.blank_mask.copy_(blank_mask)
+
+                # while_loop_kernel = create_inner_while_loop_kernel()
+                # (while_loop_conditional_handle,) = cu_call(cudart.cudaGraphConditionalHandleCreate(graph, 0, 0))
+                # not_blank_ptr = np.array([self.not_all_blank_t.data_ptr()], dtype=np.uint64)
+                # symbols_added_ptr = np.array([self.symbols_added_t.data_ptr()], dtype=np.uint64)
+                # max_symbols_ptr = np.array([self.max_symbols_t.data_ptr()], dtype=np.uint64)
+                # while_loop_args = np.array(
+                #     [
+                #         while_loop_conditional_handle.getPtr(),
+                #         not_blank_ptr.ctypes.data,
+                #         symbols_added_ptr.ctypes.data,
+                #         max_symbols_ptr.ctypes.data,
+                #     ],
+                #     dtype=np.uint64,
+                # )
+
+                (while_loop_conditional_handle,) = cu_call(cudart.cudaGraphConditionalHandleCreate(graph, 0, 0))
+
+                while_loop_kernel = nvrtc_compile_handle_setter()
+                # calculate pred of the while-loop for the first time
+                pred_whl = torch.logical_and(self.not_all_blank_t, self.symbols_added_t < self.max_symbols_t)
+                pred_whl_ptr = np.array([pred_whl.data_ptr()], dtype=np.uint64)
+                while_loop_args = np.array(
+                    [while_loop_conditional_handle.getPtr(), pred_whl_ptr.ctypes.data],
+                    dtype=np.uint64,
+                )
+
+                with with_conditional_node(
+                    while_loop_kernel, while_loop_args, while_loop_conditional_handle, self.device
+                ):
+                    # Question: the behavior seems different to the original function?
+                    g, hidden_prime = self.caller._pred_step(
+                        self.last_label.unsqueeze(1), hidden, batch_size=self.batch_size
+                    )
+                    logp = self.caller._joint_step(self.f, g, log_normalize=None)[:, 0, 0, :]
+
+                    v, k = logp.max(1)
+                    torch.where(self.blank_mask, self.zero_t, v, out=v)
+                    torch.where(self.blank_mask, self.blank_index_t, k, out=k)
+                    # Commented out code unnecessarily causes D2H copy, which is synchronous. See pytorch issue #105641
+                    # self.scores[self.seq_idx_t, :] = v
+                    # self.labels[self.seq_idx_t, :] = k
+                    self.scores.index_copy_(0, self.seq_idx_t, v.unsqueeze(0))
+                    self.labels.index_copy_(0, self.seq_idx_t, k.unsqueeze(0))
+
+                    self.blank_mask.logical_or_(k == self.caller._blank_index)
+
+                    not_blank_mask = ~self.blank_mask
+
+                    # self.caller.decoder.batch_replace_states_mask(
+                    #     src_states=hidden_prime, dst_states=hidden, mask=not_blank_mask
+                    # )
+                    dtype = hidden[0].dtype
+                    h = torch.where(not_blank_mask.unsqueeze(0).unsqueeze(-1), hidden_prime[0].to(dtype), hidden[0])
+                    hidden[0].copy_(h)
+                    h = torch.where(not_blank_mask.unsqueeze(0).unsqueeze(-1), hidden_prime[1].to(dtype), hidden[1])
+                    hidden[1].copy_(h)
+                    # self.d1.copy_(g.shape[0], non_blocking=True)
+                    # self.d2.copy_(g.shape[1], non_blocking=True)
+                    # self.d3.copy_(g.shape[2], non_blocking=True)
+                    # self.d4.copy_(hidden_prime[0].shape[3], non_blocking=True)
+                    # torch.where(self.blank_mask, self.last_label, k, out=self.last_label)
+                    last_label = torch.where(self.blank_mask, self.last_label, k)
+                    self.last_label.copy_(last_label)
+
+                    # torch.any(not_blank_mask, 0, out=self.not_all_blank_t)
+                    not_all_blank_t = torch.any(not_blank_mask, 0)
+                    self.not_all_blank_t.copy_(not_all_blank_t)
+                    self.symbols_added_t += 1
+                    self.seq_idx_t += 1
+
+                    # update the while-loop predicate
+                    pred_tmp = torch.logical_and(self.not_all_blank_t, self.symbols_added_t < self.max_symbols_t)
+                    pred_whl.copy_(pred_tmp)
+
+                self.time_idx_t += 1
+                self.seq_idx_t += self.max_symbols_t - self.symbols_added_t
+                
+                # update the for-loop predicate
+                pred_tmp = self.time_idx_t.sum() < self.max_out_len_t
+                pred_for.copy_(pred_tmp)
+
+            self.scores_gpu.copy_(
+                self.scores.transpose(0, 1).contiguous().reshape((self.batch_size, self.max_time, self.max_symbols)),
+            )
+            self.labels_gpu.copy_(
+                self.labels.transpose(0, 1).contiguous().reshape((self.batch_size, self.max_time, self.max_symbols)),
+            )
+
+            self.last_label.fill_(self.caller._SOS)
+            self.time_idx_t.fill_(0)
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        out_len: torch.Tensor,
+        device: torch.device,
+        partial_hypotheses: Optional[List[rnnt_utils.Hypothesis]] = None,
+    ):
+        if partial_hypotheses is not None:
+            raise NotImplementedError(
+                "`partial_hypotheses` support is not available "
+                "with Frame-Looping algorithm with Cuda graphs (not implemented yet)"
+            )
+
+        if self.caller.preserve_alignments:
+            raise NotImplementedError(
+                "`preserve_alignments` support is not available"
+                "with Frame-Looping algorithm with Cuda graphs (not implemented yet)"
+            )
+
+        if self.caller.preserve_frame_confidence:
+            raise NotImplementedError(
+                "`preserve_frame_confidence` support is not available"
+                "with Frame-Looping algorithm with Cuda graphs (not implemented yet)"
+            )
+
+        batch_size = x.shape[0]
+        # We could use out_len.max() here instead of x.shape[1], in
+        # case for some reason the user passes in a larger buffer than
+        # required, since we know that `out_len.max() <= x.shape[1]`.
+        max_time = x.shape[1]
+
+        if torch.is_autocast_enabled():
+            x = x.to(torch.get_autocast_gpu_dtype())
+
+        if max_time > self.max_time or batch_size > self.batch_size or self.device != x.device:
+            # In the first two cases, we need to recreate the cuda
+            # graph to handle larger tensor sizes. In the third case,
+            # we need to recreate the graph, as well as all tensors,
+            # because the computation is now happening on a different
+            # GPU. Therefore, in the third case, we unconditionally
+            # set self.first_call to True to make sure that all
+            # possibly blocking initializers are initialized properly
+            # again on the new device.
+            if self.device != x.device:
+                self.first_call = True
+            self._reinitialize(max_time, batch_size, x, out_len)
+
+        self.encoder_output[: x.shape[0], : x.shape[1], ...].copy_(x)
+        self.encoder_output_length[: out_len.shape[0]].copy_(out_len)
+        self.graph.replay()
+        torch.cuda.current_stream(device=self.device).synchronize()
+
+        # print(self.d1, self.d2, self.d3, self.d4)
+        # print(self.f.shape)
+        # self.last_labels.shape -> (8)
+        # self.f.shape -> (8, 1, 1024)
+        # g.shape -> (8, 1, 640)
+
+        self.scores_gpu[self.labels_gpu == self.caller._blank_index] = 0.0
+        total_scores = self.scores_gpu.sum(dtype=torch.float32, axis=(1, 2))
+
+        tokens_per_timestep = (self.labels_gpu != self.caller._blank_index).sum(axis=-1)
+        timesteps_packed = torch.repeat_interleave(
+            torch.arange(self.max_time, device="cuda").repeat(self.batch_size), tokens_per_timestep.flatten()
+        )
+        timestep_segments = tokens_per_timestep.sum(axis=-1)
+
+        valid_labels_mask = self.labels_gpu != self.caller._blank_index
+        labels_segments = valid_labels_mask.sum(axis=(1, 2))
+        labels_packed = self.labels_gpu[valid_labels_mask]
+
+        total_scores = total_scores.cpu()
+        timestep_segments = timestep_segments.cpu()
+        labels_segments = labels_segments.cpu()
+        labels_packed = labels_packed.cpu()
+
+        hypotheses = [
+            rnnt_utils.Hypothesis(score=0.0, y_sequence=[], timestep=[], dec_state=None) for _ in range(batch_size)
+        ]
+
+        timestep_start = 0
+        labels_start = 0
+        for i in range(batch_size):
+            hypotheses[i].timestep = timesteps_packed[timestep_start : timestep_start + timestep_segments[i]].tolist()
+            timestep_start += timestep_segments[i]
+            hypotheses[i].score = float(total_scores[i])
+            hypotheses[i].y_sequence = labels_packed[labels_start : labels_start + labels_segments[i]].tolist()
+            labels_start += labels_segments[i]
+
+        return hypotheses
+    
+
+# the original version
+class RNNTGreedyDecodeCudaGraph_ori:
+    def __init__(self, max_symbols: int, caller):
+        if HAVE_CUDA_PYTHON:
+            check_cuda_python_cuda_graphs_conditional_nodes_supported()
+        else:
+            raise ValueError("Cannot instantiate RNNTGreedyDecodeCudaGraph without `pip install cuda-python`")
+
+        assert max_symbols is not None
+
+        self.max_symbols = max_symbols
+
+        # These are cuda torch.Tensors which will be lazily allocated the first time _reinitialize() is called.
+        # We don't do it here because we don't know which cuda device we are using yet.
+        self.symbols_added_t = None
+        self.max_symbols_t = None
+        self.not_all_blank_t = None
+        self.time_idx_t = None
+        self.max_out_len_t = None
+
+        self.encoder_output = None
+        self.encoder_output_length = None
+        self.f = None
+        # We also lazily initialize a variable holding the current device
+        self.device = None
+
+        # Reasonable default maximum time. 375 frames * (80ms / frame) = 30 seconds
+        # 80ms is the frame size of recent fastconformer models
+        # This does not affect correctness.
+        self.max_time = 375
+        self.batch_size = 0
+
+        self.scores_gpu = None
+        self.labels_gpu = None
+        self.graph = None
+
+        self.first_call = True
+
+        self.caller = caller
+
+        # shape printer for debugggg...
+        # self.d1 = None
+        # self.d2 = None
+        # self.d3 = None
+        # self.d4 = None
+
+    def _reinitialize(self, max_time, batch_size, encoder_output, encoder_output_length):
+        if self.first_call:
+            # We need to call the original _greedy_decode_blank_as_pad
+            # implementation at least once beforehand in order to make
+            # sure that pytorch is "initialized". Pytorch may be
+            # uninitialized if this code runs before any other pytorch
+            # operation in this process. Pytorch often lazily
+            # initializes things like a cudnnHandle_t via
+            # cudnnCreate(), which can involve synchronizing with the
+            # host. Such actions are not stream capturable to a graph.
+            with torch.cuda.stream(torch.cuda.Stream(self.device)):
+                self.caller._greedy_decode_blank_as_pad_loop_frames(
+                    encoder_output, encoder_output_length, encoder_output.device
+                )
+
+            self.device = encoder_output.device
+
+            self.symbols_added_t = torch.tensor(0, dtype=torch.int64, device=encoder_output.device)
+            self.max_symbols_t = torch.tensor(self.max_symbols, dtype=torch.int64, device=encoder_output.device)
+            self.not_all_blank_t = torch.tensor(True, dtype=torch.bool, device=encoder_output.device)
+
+            self.time_idx_t = torch.tensor(0, dtype=torch.int64, device=encoder_output.device)
+            self.max_out_len_t = torch.tensor(0, dtype=torch.int64, device=encoder_output.device)
+
+            self.first_call = False
+
+        self.max_time = max(self.max_time, max_time)
+        self.batch_size = max(self.batch_size, batch_size)
+
+        self.encoder_output = torch.zeros(
+            (self.batch_size, self.max_time, encoder_output.shape[-1]),
+            dtype=encoder_output.dtype,
+            device=encoder_output.device,
+        )
+        self.encoder_output_length = torch.zeros(
+            (self.batch_size,), dtype=encoder_output_length.dtype, device=encoder_output_length.device
+        )
+
+        self.zero_t = torch.tensor(0.0, dtype=encoder_output.dtype, device=encoder_output.device)
+        self.blank_index_t = torch.tensor(self.caller._blank_index, dtype=torch.long, device=encoder_output.device)
+
+        self.scores_gpu = torch.zeros(
+            (self.batch_size, self.max_time, self.max_symbols),
+            dtype=encoder_output.dtype,
+            device="cuda",
+        )
+        self.labels_gpu = torch.zeros(
+            (self.batch_size, self.max_time, self.max_symbols), dtype=torch.int64, device="cuda",
+        )
+
+        # shape printer for debugggg...
+        # self.d1 = torch.zeros(1, device="cpu", pin_memory=True)
+        # self.d2 = torch.zeros(1, device="cpu", pin_memory=True)
+        # self.d3 = torch.zeros(1, device="cpu", pin_memory=True)
+        # self.d4 = torch.zeros(1, device="cpu", pin_memory=True)
 
         # Question: why is this line needed?
         self.graph = None
@@ -270,6 +661,10 @@ class RNNTGreedyDecodeCudaGraph_:
                     self.caller.decoder.batch_replace_states_mask(
                         src_states=hidden_prime, dst_states=hidden, mask=not_blank_mask
                     )
+                    # self.d1.copy_(g.shape[0], non_blocking=True)
+                    # self.d2.copy_(g.shape[1], non_blocking=True)
+                    # self.d3.copy_(g.shape[2], non_blocking=True)
+                    # self.d4.copy_(hidden_prime[0].shape[3], non_blocking=True)
                     torch.where(self.blank_mask, self.last_label, k, out=self.last_label)
 
                     torch.any(not_blank_mask, 0, out=self.not_all_blank_t)
@@ -279,13 +674,11 @@ class RNNTGreedyDecodeCudaGraph_:
                 self.time_idx_t += 1
                 self.seq_idx_t += self.max_symbols_t - self.symbols_added_t
 
-            self.scores_cpu.copy_(
+            self.scores_gpu.copy_(
                 self.scores.transpose(0, 1).contiguous().reshape((self.batch_size, self.max_time, self.max_symbols)),
-                non_blocking=True,
             )
-            self.labels_cpu.copy_(
+            self.labels_gpu.copy_(
                 self.labels.transpose(0, 1).contiguous().reshape((self.batch_size, self.max_time, self.max_symbols)),
-                non_blocking=True,
             )
 
             self.last_label.fill_(self.caller._SOS)
@@ -343,18 +736,29 @@ class RNNTGreedyDecodeCudaGraph_:
         self.graph.replay()
         torch.cuda.current_stream(device=self.device).synchronize()
 
-        self.scores_cpu[self.labels_cpu == self.caller._blank_index] = 0.0
-        total_scores = self.scores_cpu.sum(dtype=torch.float32, axis=(1, 2))
+        # print(self.d1, self.d2, self.d3, self.d4)
+        # print(self.f.shape)
+        # self.last_labels.shape -> (8)
+        # self.f.shape -> (8, 1, 1024)
+        # g.shape -> (8, 1, 640)
 
-        tokens_per_timestep = (self.labels_cpu != self.caller._blank_index).sum(axis=-1)
+        self.scores_gpu[self.labels_gpu == self.caller._blank_index] = 0.0
+        total_scores = self.scores_gpu.sum(dtype=torch.float32, axis=(1, 2))
+
+        tokens_per_timestep = (self.labels_gpu != self.caller._blank_index).sum(axis=-1)
         timesteps_packed = torch.repeat_interleave(
-            torch.arange(self.max_time).repeat(self.batch_size), tokens_per_timestep.flatten()
+            torch.arange(self.max_time, device="cuda").repeat(self.batch_size), tokens_per_timestep.flatten()
         )
         timestep_segments = tokens_per_timestep.sum(axis=-1)
 
-        valid_labels_mask = self.labels_cpu != self.caller._blank_index
+        valid_labels_mask = self.labels_gpu != self.caller._blank_index
         labels_segments = valid_labels_mask.sum(axis=(1, 2))
-        labels_packed = self.labels_cpu[valid_labels_mask]
+        labels_packed = self.labels_gpu[valid_labels_mask]
+
+        total_scores = total_scores.cpu()
+        timestep_segments = timestep_segments.cpu()
+        labels_segments = labels_segments.cpu()
+        labels_packed = labels_packed.cpu()
 
         hypotheses = [
             rnnt_utils.Hypothesis(score=0.0, y_sequence=[], timestep=[], dec_state=None) for _ in range(batch_size)
@@ -410,8 +814,8 @@ class RNNTGreedyDecodeCudaGraph:
         self.max_time = 375
         self.batch_size = 0
 
-        self.scores_cpu = None
-        self.labels_cpu = None
+        self.scores_gpu = None
+        self.labels_gpu = None
         self.graph = None
 
         self.first_call = True
@@ -471,14 +875,13 @@ class RNNTGreedyDecodeCudaGraph:
         self.zero_t = torch.tensor(0.0, dtype=encoder_output.dtype, device=encoder_output.device)
         self.blank_index_t = torch.tensor(self.caller._blank_index, dtype=torch.long, device=encoder_output.device)
         # store the model's output
-        self.scores_cpu = torch.zeros(
+        self.scores_gpu = torch.zeros(
             (self.batch_size, self.max_time, self.max_symbols),
             dtype=encoder_output.dtype,
-            device="cpu",
-            pin_memory=True,
+            device="cuda",
         )
-        self.labels_cpu = torch.zeros(
-            (self.batch_size, self.max_time, self.max_symbols), dtype=torch.int64, device="cpu", pin_memory=True
+        self.labels_gpu = torch.zeros(
+            (self.batch_size, self.max_time, self.max_symbols), dtype=torch.int64, device="cuda",
         )
 
         # shape printer for debugggg...
@@ -508,6 +911,10 @@ class RNNTGreedyDecodeCudaGraph:
             self.last_label = torch.full(
                 [self.batch_size], fill_value=self.caller._SOS, dtype=torch.long, device=encoder_output.device
             )
+            # self.d1.copy_(self.last_label.shape[0], non_blocking=True)
+            # self.d2.copy_(hidden[0].shape[1], non_blocking=True)
+            # self.d3.copy_(hidden[0].shape[2], non_blocking=True)
+            # self.d4.copy_(hidden_prime[0].shape[3], non_blocking=True)
             # blank_mask -> blank_mask (indicate the completed sequences in a batch)
             self.blank_mask = torch.full(
                 [self.batch_size], fill_value=0, dtype=torch.bool, device=encoder_output.device
@@ -537,6 +944,7 @@ class RNNTGreedyDecodeCudaGraph:
 
             def outer_body_fn(time_idx, x):
                 # pick the audio feature f_t from x
+                # torch.index_select(x, 1, time_idx.unsqueeze(0), out=self.f)
                 f = torch.index_select(x, 1, time_idx.unsqueeze(0))
                 self.f.copy_(f)
                 
@@ -546,6 +954,7 @@ class RNNTGreedyDecodeCudaGraph:
 
                 # [ERROR] use the "out" syntax will cause an error
                 # torch._dynamo.exc.InternalTorchDynamoError: grapharg
+                # torch.ge(time_idx, self.encoder_output_length, out=self.blank_mask)
                 blank_mask = torch.ge(time_idx, self.encoder_output_length)
                 self.blank_mask.copy_(blank_mask)
                 
@@ -556,6 +965,11 @@ class RNNTGreedyDecodeCudaGraph:
                 def body_fn(symbols_added):
                     # run the text encoder (cause torchdynamo graph breaks cause it's a LSTM model...) and joiner to get the predictions
                     g, hidden_prime = self.caller._pred_step(self.last_label.unsqueeze(1), hidden, batch_size=self.batch_size)
+                    # self.label.shape -> (8,)
+                    # self.d1.copy_(hidden_prime[0].shape[0], non_blocking=True)
+                    # self.d2.copy_(hidden_prime[0].shape[1], non_blocking=True)
+                    # self.d3.copy_(hidden_prime[0].shape[2], non_blocking=True)
+                    # self.d4.copy_(hidden_prime[0].shape[3], non_blocking=True)
                     # g = torch.zeros((self.batch_size, 1, 640), device="cuda")
                     # hidden_prime = (torch.zeros((2, self.batch_size, 640), device="cuda"), torch.zeros((2, self.batch_size, 640), device="cuda"))
                     logp = self.caller._joint_step(self.f, g, log_normalize=None)[:, 0, 0, :]
@@ -579,17 +993,21 @@ class RNNTGreedyDecodeCudaGraph:
                     # hidden_prime shapes: ((2, 1, 8, 640), (2, 1, 8, 640)) -> in here ???
                     # hidden shapes: ((2, 8, 640), (2, 8, 640)) -> in here
                     dtype = hidden[0].dtype
+                    # torch.where(not_blank_mask.unsqueeze(0).unsqueeze(-1), hidden_prime[0].squeeze(1).to(dtype), hidden[0], out=hidden[0])
                     h = torch.where(not_blank_mask.unsqueeze(0).unsqueeze(-1), hidden_prime[0].squeeze(1).to(dtype), hidden[0])
-                    # self.d1.copy_(hidden[0].shape[0], non_blocking=True)
-                    # self.d2.copy_(hidden[0].shape[1], non_blocking=True)
-                    # self.d3.copy_(hidden[0].shape[2], non_blocking=True)
-                    # self.d4.copy_(hidden[0].shape[3], non_blocking=True)
+                    # self.d1.copy_(hidden_prime[0].shape[0], non_blocking=True)
+                    # self.d2.copy_(hidden_prime[0].shape[1], non_blocking=True)
+                    # self.d3.copy_(hidden_prime[0].shape[2], non_blocking=True)
+                    # self.d4.copy_(hidden_prime[0].shape[3], non_blocking=True)
                     hidden[0].copy_(h)
+                    # torch.where(not_blank_mask.unsqueeze(0).unsqueeze(-1), hidden_prime[1].squeeze(1).to(dtype), hidden[1], out=hidden[1])
                     h = torch.where(not_blank_mask.unsqueeze(0).unsqueeze(-1), hidden_prime[1].squeeze(1).to(dtype), hidden[1])
                     hidden[1].copy_(h)
-
+                    
+                    # torch.where(self.blank_mask, self.last_label, k, out=self.last_label)
                     last_label = torch.where(self.blank_mask, self.last_label, k)
                     self.last_label.copy_(last_label)
+                    # torch.any(not_blank_mask, 0, out=self.not_all_blank_t)
                     not_all_blank_t = torch.any(not_blank_mask, 0)
                     self.not_all_blank_t.copy_(not_all_blank_t)
 
@@ -611,13 +1029,11 @@ class RNNTGreedyDecodeCudaGraph:
             _ = while_loop(outer_cond_fn, outer_body_fn, (self.time_idx_t, self.encoder_output))
 
             # copy the predictions of the batch data back to cpu for hypothesis
-            self.scores_cpu.copy_(
+            self.scores_gpu.copy_(
                 self.scores.transpose(0, 1).contiguous().reshape((self.batch_size, self.max_time, self.max_symbols)),
-                non_blocking=True,
             )
-            self.labels_cpu.copy_(
+            self.labels_gpu.copy_(
                 self.labels.transpose(0, 1).contiguous().reshape((self.batch_size, self.max_time, self.max_symbols)),
-                non_blocking=True,
             )
 
             self.last_label.fill_(self.caller._SOS)
@@ -680,18 +1096,29 @@ class RNNTGreedyDecodeCudaGraph:
         self.graph.replay()
         torch.cuda.current_stream(device=self.device).synchronize()
 
-        self.scores_cpu[self.labels_cpu == self.caller._blank_index] = 0.0
-        total_scores = self.scores_cpu.sum(dtype=torch.float32, axis=(1, 2))
+        # print(self.d1, self.d2, self.d3, self.d4)
+        # print("L:", self.last_label.shape)
+        # self.f.shape -> (8, 1, 1024)
+        # g.shape -> (8, 1, 640)
+        # self.last_label.shape -> (8)
 
-        tokens_per_timestep = (self.labels_cpu != self.caller._blank_index).sum(axis=-1)
+        self.scores_gpu[self.labels_gpu == self.caller._blank_index] = 0.0
+        total_scores = self.scores_gpu.sum(dtype=torch.float32, axis=(1, 2))
+
+        tokens_per_timestep = (self.labels_gpu != self.caller._blank_index).sum(axis=-1)
         timesteps_packed = torch.repeat_interleave(
-            torch.arange(self.max_time).repeat(self.batch_size), tokens_per_timestep.flatten()
+            torch.arange(self.max_time, device="cuda").repeat(self.batch_size), tokens_per_timestep.flatten()
         )
         timestep_segments = tokens_per_timestep.sum(axis=-1)
 
-        valid_labels_mask = self.labels_cpu != self.caller._blank_index
+        valid_labels_mask = self.labels_gpu != self.caller._blank_index
         labels_segments = valid_labels_mask.sum(axis=(1, 2))
-        labels_packed = self.labels_cpu[valid_labels_mask]
+        labels_packed = self.labels_gpu[valid_labels_mask]
+
+        total_scores = total_scores.cpu()
+        timestep_segments = timestep_segments.cpu()
+        labels_segments = labels_segments.cpu()
+        labels_packed = labels_packed.cpu()
 
         hypotheses = [
             rnnt_utils.Hypothesis(score=0.0, y_sequence=[], timestep=[], dec_state=None) for _ in range(batch_size)

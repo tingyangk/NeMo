@@ -541,15 +541,20 @@ class BeamRNNTInfer(Typing):
             nbest_hyps: N-best decoding results
         """
         # Initialize states
+        # self.vocab_size -> defined in the RNNTDecoder, which is 1024 here
+        # beam is the length limit of set A; beam size cannot exceed the vocab_size
+        # beam_k is top k tokens with the highest logits (exclude blank!!!)
         beam = min(self.beam_size, self.vocab_size)
         beam_k = min(beam, (self.vocab_size - 1))
         blank_tensor = torch.tensor([self.blank], device=h.device, dtype=torch.long)
 
         # Precompute some constants for blank position
+        # keep all indices in a list except the blank index
         ids = list(range(self.vocab_size + 1))
         ids.remove(self.blank)
 
         # Used when blank token is first vs last token
+        # suppose the blank index would only be put in the beginning or the very end
         if self.blank == 0:
             index_incr = 1
         else:
@@ -562,6 +567,7 @@ class BeamRNNTInfer(Typing):
         kept_hyps = [Hypothesis(score=0.0, y_sequence=[self.blank], dec_state=dec_state, timestep=[-1], length=0)]
         cache = {}
 
+        # no idea about what's partial hypothesis now... this also occurs in greedy search algo
         if partial_hypotheses is not None:
             if len(partial_hypotheses.y_sequence) > 0:
                 kept_hyps[0].y_sequence = [int(partial_hypotheses.y_sequence[-1].cpu().numpy())]
@@ -571,16 +577,26 @@ class BeamRNNTInfer(Typing):
         if self.preserve_alignments:
             kept_hyps[0].alignments = [[]]
 
+        # "encoded_lengths" is the number of time frames from a "single" audio file since beam search decoding is done without batch input
         for i in range(int(encoded_lengths)):
+            # h is the audio feature [1, T, D]
             hi = h[:, i : i + 1, :]  # [1, 1, D]
+            # hyps -> set A (hypotheses without \phi in the end)
+            # kept_hyps -> set B (hypotheses with \phi in the end)
             hyps = kept_hyps
             kept_hyps = []
 
+            # should break when the K-highest prob in set B is higher than all the prob in set A
             while True:
+                # take the maximum hyps from set A and remove it from set A
                 max_hyp = max(hyps, key=lambda x: x.score)
                 hyps.remove(max_hyp)
 
                 # update decoder state and get next score
+                # similar to the predict() method used in greedy decoding
+                # y is a torch.Tensor of shape [1, 1, H] representing the score of the last token in the Hypothesis.
+                # state is a list of RNN states, each of shape [L, 1, H].
+                # lm_token is the final integer token of the hypothesis.
                 y, state, lm_tokens = self.decoder.score_hypothesis(max_hyp, cache)  # [1, 1, D]
 
                 # get next token
@@ -592,9 +608,13 @@ class BeamRNNTInfer(Typing):
                     logprobs = ytu.cpu().clone()
 
                 # remove blank token before top k
+                # keep the logits of all tokens except blank -> get the top k logits of all the tokens
                 top_k = ytu[ids].topk(beam_k, dim=-1)
 
                 # Two possible steps - blank token or non-blank token predicted
+                # top_k[0] -> the values (e.g. tensor([-2.4553, -2.6436, -2.6443, -2.7668, -2.8681]))
+                # top_k[1] -> the indices (e.g. tensor([22, 17, 16, 19, 12]))
+                # concat the values/index of blank to ytu
                 ytu = (
                     torch.cat((top_k[0], ytu[self.blank].unsqueeze(0))),
                     torch.cat((top_k[1] + index_incr, blank_tensor)),
@@ -602,6 +622,8 @@ class BeamRNNTInfer(Typing):
 
                 # for each possible step
                 for logp, k in zip(*ytu):
+                    # logp is the logits and k is the index
+                    # they just...simply add the logits to it!!
                     # construct hypothesis for step
                     new_hyp = Hypothesis(
                         score=(max_hyp.score + float(logp)),
@@ -616,8 +638,10 @@ class BeamRNNTInfer(Typing):
                         new_hyp.alignments = copy.deepcopy(max_hyp.alignments)
 
                     # if current token is blank, dont update sequence, just store the current hypothesis
+                    # store this hyp to set B
                     if k == self.blank:
                         kept_hyps.append(new_hyp)
+                    # store this "updated" hyp back to set A
                     else:
                         # if non-blank token was predicted, update state and sequence and then search more hypothesis
                         new_hyp.dec_state = state
@@ -638,7 +662,9 @@ class BeamRNNTInfer(Typing):
                             )
 
                 # keep those hypothesis that have scores greater than next search generation
+                # hyps_max -> the highest prob in set A
                 hyps_max = float(max(hyps, key=lambda x: x.score).score)
+                # keep only the hyps that have scores higher than the hyps_max and sort them
                 kept_most_prob = sorted([hyp for hyp in kept_hyps if hyp.score > hyps_max], key=lambda x: x.score,)
 
                 # If enough hypothesis have scores greater than next search generation,
@@ -666,6 +692,10 @@ class BeamRNNTInfer(Typing):
 
         return self.sort_nbest(kept_hyps)
 
+    # Summary to TSD (to my understanding):
+    # Compared to the original beam serach decoding, TSD is more "efficiency constraint" because the number
+    # of loops run are determined. Also, it inference a "batch" of sequences at each "joint call".
+    # sooooooooo slow...
     def time_sync_decoding(
         self, h: torch.Tensor, encoded_lengths: torch.Tensor, partial_hypotheses: Optional[Hypothesis] = None
     ) -> List[Hypothesis]:
@@ -698,6 +728,7 @@ class BeamRNNTInfer(Typing):
         )  # [L, B, H], [L, B, H] (for LSTMs)
 
         # Initialize first hypothesis for the beam (blank)
+        # I suspect the batch_select_state does nothing... cause this func is called sequence by sequence
         B = [
             Hypothesis(
                 y_sequence=[self.blank],
@@ -714,20 +745,34 @@ class BeamRNNTInfer(Typing):
             for hyp in B:
                 hyp.alignments = [[]]
 
+        # "encoded_lengths" is the number of time frames from a "single" audio file since beam search decoding is done without batch input
         for i in range(int(encoded_lengths)):
+            # h is the audio feature [1, T, D]
+            # hi: [1, 1, D] -> audio feature of a single time frame
             hi = h[:, i : i + 1, :]
 
+            # A -> beams in t
+            # B -> beams in t-1
+            # C -> symbol expansion step in v-1 (in time frame t)
+            # D -> symbol expansion step in v (in time frame t)
+
             # Update caches
+            # in the beginning of each time frame, empty A
             A = []
+            # in the beginning of each time frame, let C start with the result from last time frame
             C = B
 
             h_enc = hi
 
             # For a limited number of symmetric expansions per timestep "i"
+            # self.tsd_max_symmetric_expansion_per_step -> default is 50 but it's 10 here?!
+            # import ipdb; ipdb.set_trace()
             for v in range(self.tsd_max_symmetric_expansion_per_step):
+                # in the beginning of each "symbol expansion" step, empty D
                 D = []
 
                 # Decode a batch of beam states and scores
+                # needs batch_score_hypo cause we have "C" hypotheses
                 beam_y, beam_state, beam_lm_tokens = self.decoder.batch_score_hypothesis(C, cache, beam_state)
 
                 # Extract the log probabilities and the predicted tokens
@@ -737,13 +782,19 @@ class BeamRNNTInfer(Typing):
                 beam_logp = beam_logp[:, 0, 0, :]  # [B, V + 1]
                 beam_topk = beam_logp[:, ids].topk(beam, dim=-1)
 
+                # get all the sequences from "the current time frame" so far
+                # something like this: [[1024], [1024, 4], [1024, 312], [1024, 25], [1024, 266], [1024, 32]]
                 seq_A = [h.y_sequence for h in A]
 
+                # the len of C is always the beam size (default as 4)
+                # "force to" end the sequence with a blank symbol
                 for j, hyp in enumerate(C):
                     # create a new hypothesis in A
                     if hyp.y_sequence not in seq_A:
                         # If the sequence is not in seq_A, add it as the blank token
-                        # In this step, we dont add a token but simply update score
+                        # In this step, we dont add a token (to the sequence!) but simply update score
+                        # e.g. update the score of "(blank, blank, ...), (i, s, blank, blank....)"
+                        # also need to consider the same output in different sequence of C!
                         _temp_hyp = Hypothesis(
                             score=(hyp.score + float(beam_logp[j, self.blank])),
                             y_sequence=hyp.y_sequence[:],
@@ -765,10 +816,12 @@ class BeamRNNTInfer(Typing):
                         # merge the existing blank hypothesis score with current score.
                         dict_pos = seq_A.index(hyp.y_sequence)
 
+                        # probably the way to calculate "non-first scores" is different (need to add logexp)
                         A[dict_pos].score = np.logaddexp(
                             A[dict_pos].score, (hyp.score + float(beam_logp[j, self.blank]))
                         )
 
+                # when the output is not a blank symbol
                 if v < self.tsd_max_symmetric_expansion_per_step:
                     for j, hyp in enumerate(C):
                         # for each current hypothesis j
@@ -857,6 +910,7 @@ class BeamRNNTInfer(Typing):
         # prepare the batched beam states
         beam = min(self.beam_size, self.vocab_size)
 
+        # h is the audio feature [1, T, D]
         h = h[0]  # [T, D]
         h_length = int(encoded_lengths)
         beam_state = self.decoder.initialize_state(
@@ -865,6 +919,7 @@ class BeamRNNTInfer(Typing):
 
         # compute u_max as either a specific static limit,
         # or a multiple of current `h_length` dynamically.
+        # self.alsd_max_target_length default's 1.0
         if type(self.alsd_max_target_length) == float:
             u_max = int(self.alsd_max_target_length * h_length)
         else:
@@ -885,11 +940,17 @@ class BeamRNNTInfer(Typing):
         if self.preserve_alignments:
             B[0].alignments = [[]]
 
+        # store the "final" hypotheses
         final = []
         cache = {}
 
         # ALSD runs for T + U_max steps
+        import ipdb; # ipdb.set_trace()
         for i in range(h_length + u_max):
+            
+            # set A -> the beam at alignment step i
+            # set B -> the beam at alignment step i-1
+
             # Update caches
             A = []
             B_ = []
@@ -901,8 +962,11 @@ class BeamRNNTInfer(Typing):
             batch_ids = list(range(len(B)))  # initialize as a list of all batch ids
             batch_removal_ids = []  # update with sample ids which are removed
 
+            # beam size default is 4, so len(B) is 4
+            # ipdb.set_trace()
             for bid, hyp in enumerate(B):
                 u = len(hyp.y_sequence) - 1
+                # the number of frames covered by the seq.
                 t = i - u
 
                 if t > (h_length - 1):
@@ -913,6 +977,8 @@ class BeamRNNTInfer(Typing):
                 h_states.append((t, h[t]))
 
             if B_:
+                # This step is just for making sure we can get the correct beam state (i.e. output of the text decoder)
+                # if we have "remove" some of the sequences
                 # Compute the subset of batch ids which were *not* removed from the list above
                 sub_batch_ids = None
                 if len(B_) != beam:
@@ -941,6 +1007,7 @@ class BeamRNNTInfer(Typing):
                 beam_y, beam_state_, beam_lm_tokens = self.decoder.batch_score_hypothesis(B_, cache, beam_state_)
 
                 # If only a subset of batch ids were updated (some were removed)
+                # put the "sub-batch" beam state back to the original beam state with their corresponding indices
                 if sub_batch_ids is not None:
                     # For each state in the RNN (2 for LSTM)
                     for state_id in range(len(beam_state)):
@@ -965,15 +1032,19 @@ class BeamRNNTInfer(Typing):
                 h_enc = h_enc.unsqueeze(1)  # [B=beam, T=1, D]; batch over the beams
 
                 # Extract the log probabilities and the predicted tokens
+                # h_enc contains audio features in "different" time frames!
                 beam_logp = torch.log_softmax(
                     self.joint.joint(h_enc, beam_y) / self.softmax_temperature, dim=-1
                 )  # [B=beam, 1, 1, V + 1]
                 beam_logp = beam_logp[:, 0, 0, :]  # [B=beam, V + 1]
                 beam_topk = beam_logp[:, ids].topk(beam, dim=-1)
 
+                # for each hyps, either add a blank then append to A or add their highest "beam=4" tokens (in parallel) and append to A
                 for j, hyp in enumerate(B_):
                     # For all updated samples in the batch, add it as the blank token
                     # In this step, we dont add a token but simply update score
+                    # force adding a blank to the sequence
+                    # the seq. len does not increase -> "t" will increase in the next iter! (move to the next audio frame)
                     new_hyp = Hypothesis(
                         score=(hyp.score + float(beam_logp[j, self.blank])),
                         y_sequence=hyp.y_sequence[:],
@@ -996,6 +1067,7 @@ class BeamRNNTInfer(Typing):
 
                     # If the prediction "timestep" t has reached the length of the input sequence
                     # we can add it to the "finished" hypothesis list.
+                    # h_states = list of [t, h[t]]
                     if h_states[j][0] == (h_length - 1):
                         final.append(new_hyp)
 
@@ -1008,6 +1080,9 @@ class BeamRNNTInfer(Typing):
 
                     # for each current hypothesis j
                     # extract the top token score and top token id for the jth hypothesis
+                    # beam_topk -> [torch.Size([4, 4]): 4 sequences, torch.Size([4, 4]): top 4 tokens]
+                    # logp -> logits; k -> index
+                    # the seq. len increase 1 -> "t" stays unchanged in the next iter! (stay at the same audio frame)
                     for logp, k in zip(beam_topk[0][j], beam_topk[1][j] + index_incr):
                         # create new hypothesis and store in A
                         # Note: This loop does *not* include the blank token!
@@ -1033,7 +1108,9 @@ class BeamRNNTInfer(Typing):
                 # Prune and recombine same hypothesis
                 # This may cause next beam to be smaller than max beam size
                 # Therefore larger beam sizes may be required for better decoding.
+                # set A may contain duplicate seq. with different scores -> do recombination
                 B = sorted(A, key=lambda x: x.score, reverse=True)[:beam]
+                # ipdb.set_trace()
                 B = self.recombine_hypotheses(B)
 
                 if self.preserve_alignments:
@@ -1049,7 +1126,7 @@ class BeamRNNTInfer(Typing):
             elif len(batch_ids) == len(batch_removal_ids):
                 # break early
                 break
-
+        # ipdb.set_trace()
         if final:
             # Remove trailing empty list of alignments
             if self.preserve_alignments:
@@ -1390,7 +1467,9 @@ class BeamRNNTInfer(Typing):
             else:
                 final.append(hyp)
 
-        return hypotheses
+        # why returning hypotheses???
+        # return hypotheses›
+        return final
 
     def resolve_joint_output(self, enc_out: torch.Tensor, dec_out: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """

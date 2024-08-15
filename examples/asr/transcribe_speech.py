@@ -420,8 +420,15 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
                     )
                 total_duration += item["duration"]
 
-    with autocast(dtype=amp_dtype, enabled=cfg.amp):
-        with torch.no_grad():
+    # with autocast(dtype=amp_dtype, enabled=cfg.amp):
+    #     with torch.no_grad():
+    with autocast(dtype=amp_dtype, enabled=cfg.amp), torch.no_grad():  
+        for _ in range(2):
+            # if _ == 1:
+            #     import nvtx
+            #     torch.cuda.cudart().cudaProfilerStart()
+            #     pr = nvtx.Profile()
+            #     pr.enable()
             if cfg.calculate_rtfx:
                 start_time = time.time()
             if partial_audio:
@@ -506,6 +513,7 @@ def main(cfg: TranscriptionConfig) -> Union[TranscriptionConfig, List[Hypothesis
 
     if cfg.calculate_rtfx:
         logging.info(f"Dataset RTFx {(total_duration/transcribe_time)}")
+        logging.info(f"Transcribe time {(transcribe_time)}")
 
     return cfg
 

@@ -14,6 +14,7 @@
 
 import json
 import os
+import time
 import tempfile
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
@@ -378,13 +379,21 @@ class TranscriptionMixin(ABC):
                 else:
                     verbose = True
 
+                enc_time = dec_time = 0
+                ratio = []
                 for test_batch in tqdm(dataloader, desc="Transcribing", disable=not verbose):
                     # Move batch to device
                     test_batch = move_to_device(test_batch, transcribe_cfg._internal.device)
                     # Run forward pass
+                    t1 = time.time()
                     model_outputs = self._transcribe_forward(test_batch, transcribe_cfg)
+                    t2 = time.time()
+                    enc_time += (t2 - t1)
                     processed_outputs = self._transcribe_output_processing(model_outputs, transcribe_cfg)
-
+                    t3 = time.time()
+                    dec_time += (t3 - t2)
+                    ratio.append((t3 - t2) / (t3 - t1))
+                    # raw_time.append((t2 - t1, t3 - t2))
                     # clear up memory
                     del test_batch, model_outputs
 
@@ -392,6 +401,10 @@ class TranscriptionMixin(ABC):
                     yield processed_outputs
 
                     del processed_outputs
+                print("Encoder time:", enc_time)
+                print("Decoding time:", dec_time)
+                print("Total time:", enc_time + dec_time)
+                print("Average ratio: {}".format(sum(ratio) / len(ratio)))
 
         finally:
             # set mode back to its original value

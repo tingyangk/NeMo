@@ -343,8 +343,8 @@ def run_nvrtc(kernel_string: str, kernel_name: bytes, program_name: bytes):
     assert_drv(err)
     buf = b" " * size
     (err,) = nvrtc.nvrtcGetProgramLog(prog, buf)
-    print("GALVEZ:output buffer")
-    print(buf)
+    # print("GALVEZ:output buffer")
+    # print(buf)
     assert_drv(err)
 
     # Get PTX from compilation
